@@ -39,6 +39,7 @@ N = 128  # matrix dimension; fixed for the Qwen3-Next chunked GDN tri-inverse
 M_TILE = 32  # row-tile size for the M-parallel inner loop
 K_TILE = 64  # K-reduction tile (gemm-style K-blocking inside each matmul)
 M_CHUNK = 1  # M-tiles bundled per incore kernel
+B_CHUNK = 1  # batch elements bundled per incore kernel in the batched build
 
 
 def build_tri_inverse_program(
@@ -144,6 +145,115 @@ def build_tri_inverse_program(
             return out
 
     return TriInverseProgram
+
+
+def build_batched_tri_inverse_program(
+    n: int = N,
+    batch: int = 1,
+    m_tile: int = M_TILE,
+    k_tile: int = K_TILE,
+    m_chunk: int = M_CHUNK,
+    b_chunk: int = B_CHUNK,
+):
+    """Build a @pl.program that inverts `batch` independent strict-lower
+    n x n matrices in one launch.
+
+    A/out are laid out as flat 2D tensors of shape [batch * n, n], with the
+    b'th input occupying rows [b*n : (b+1)*n].  Each batch element is
+    dispatched as one parallel iteration of an outer pl.parallel; inside
+    each batch iter, the same M-tiled / K-blocked doubling loop from
+    build_tri_inverse_program runs against the b'th slab.  State tensors
+    (X_state, Y_state, Y_temp) are similarly shaped [batch * n, n] so the
+    7-iter doubling can flow across pl.at scopes without aliasing other
+    batch elements.
+
+    For batch=1 this collapses to the same shape as build_tri_inverse_program;
+    use the unbatched version when timing single calls and the batched
+    version when amortising NPU launch overhead across many matrices.
+    """
+    n_steps = max(1, (n - 1).bit_length())
+    k_blocks = n // k_tile
+    big = batch * n  # flat row dim covering all batch elements
+
+    @pl.program
+    class BatchedTriInverseProgram:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def tri_inverse(
+            self,
+            A: pl.Tensor[[big, n], pl.FP32],
+            identity: pl.Tensor[[n, n], pl.FP32],
+            out: pl.Out[pl.Tensor[[big, n], pl.FP32]],
+        ) -> pl.Tensor[[big, n], pl.FP32]:
+            X_state = pl.create_tensor([big, n], dtype=pl.FP32)
+            Y_state = pl.create_tensor([big, n], dtype=pl.FP32)
+            Y_temp = pl.create_tensor([big, n], dtype=pl.FP32)
+
+            with pl.at(level=pl.Level.CORE_GROUP,
+                       optimization=pl.chunked_loop_optimizer,
+                       name_hint="cayley_batched_init"):
+                for b in pl.parallel(0, batch, 1, chunk=b_chunk):
+                    base = b * n
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        id_row = pl.slice(identity, [m_tile, n], [mb, 0])
+                        a_row = pl.slice(A, [m_tile, n], [base + mb, 0])
+                        X_state = pl.assemble(X_state, id_row, [base + mb, 0])
+                        Y_state = pl.assemble(Y_state, a_row, [base + mb, 0])
+
+            for step in pl.unroll(n_steps):
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="cayley_batched_x_update"):
+                    for b in pl.parallel(0, batch, 1, chunk=b_chunk):
+                        base = b * n
+                        for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                            x_row = pl.slice(X_state, [m_tile, n], [base + mb, 0])
+                            xa0 = pl.slice(X_state, [m_tile, k_tile], [base + mb, 0])
+                            yb0 = pl.slice(Y_state, [k_tile, n], [base, 0])
+                            acc = pl.matmul(xa0, yb0)
+                            for kb in pl.range(1, k_blocks):
+                                k0 = kb * k_tile
+                                xa = pl.slice(X_state, [m_tile, k_tile], [base + mb, k0])
+                                yb = pl.slice(Y_state, [k_tile, n], [base + k0, 0])
+                                acc = pl.matmul_acc(acc, xa, yb)
+                            x_new_row = pl.add(x_row, acc)
+                            X_state = pl.assemble(X_state, x_new_row, [base + mb, 0])
+
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="cayley_batched_y_snapshot"):
+                    for b in pl.parallel(0, batch, 1, chunk=b_chunk):
+                        base = b * n
+                        for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                            y_row = pl.slice(Y_state, [m_tile, n], [base + mb, 0])
+                            Y_temp = pl.assemble(Y_temp, y_row, [base + mb, 0])
+
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="cayley_batched_y_square"):
+                    for b in pl.parallel(0, batch, 1, chunk=b_chunk):
+                        base = b * n
+                        for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                            ya0 = pl.slice(Y_temp, [m_tile, k_tile], [base + mb, 0])
+                            yb0 = pl.slice(Y_temp, [k_tile, n], [base, 0])
+                            acc = pl.matmul(ya0, yb0)
+                            for kb in pl.range(1, k_blocks):
+                                k0 = kb * k_tile
+                                ya = pl.slice(Y_temp, [m_tile, k_tile], [base + mb, k0])
+                                yb = pl.slice(Y_temp, [k_tile, n], [base + k0, 0])
+                                acc = pl.matmul_acc(acc, ya, yb)
+                            Y_state = pl.assemble(Y_state, acc, [base + mb, 0])
+
+            with pl.at(level=pl.Level.CORE_GROUP,
+                       optimization=pl.chunked_loop_optimizer,
+                       name_hint="cayley_batched_out"):
+                for b in pl.parallel(0, batch, 1, chunk=b_chunk):
+                    base = b * n
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        x_row = pl.slice(X_state, [m_tile, n], [base + mb, 0])
+                        out = pl.assemble(out, x_row, [base + mb, 0])
+            return out
+
+    return BatchedTriInverseProgram
 
 
 # ---------------------------------------------------------------------------
