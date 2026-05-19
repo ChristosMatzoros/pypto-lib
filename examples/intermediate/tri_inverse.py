@@ -88,6 +88,7 @@ def build_tri_inverse_program(
             X_state = pl.create_tensor([n, n], dtype=pl.FP32)
             Y_state = pl.create_tensor([n, n], dtype=pl.FP32)
             Y_temp = pl.create_tensor([n, n], dtype=pl.FP32)
+            X_acc = pl.create_tensor([n, n], dtype=pl.FP32)
 
             with pl.at(level=pl.Level.CORE_GROUP,
                        optimization=pl.chunked_loop_optimizer,
@@ -99,11 +100,15 @@ def build_tri_inverse_program(
                     Y_state = pl.assemble(Y_state, a_row, [mb, 0])
 
             for step in pl.unroll(n_steps):
+                # Split X update: matmul first (writes X_acc), then add(X, X_acc).
+                # Keeping x_row + acc + x_new alive in one scope is the dominant
+                # Vec cost at n=256 (3 row tiles of size m_tile*n*4 bytes); splitting
+                # roughly halves the live set per scope and lets the kernel
+                # compile for n=256 with the same m_tile=32, k_tile=64 config.
                 with pl.at(level=pl.Level.CORE_GROUP,
                            optimization=pl.chunked_loop_optimizer,
-                           name_hint="cayley_x_update"):
+                           name_hint="cayley_x_matmul"):
                     for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
-                        x_row = pl.slice(X_state, [m_tile, n], [mb, 0])
                         xa0 = pl.slice(X_state, [m_tile, k_tile], [mb, 0])
                         yb0 = pl.slice(Y_state, [k_tile, n], [0, 0])
                         acc = pl.matmul(xa0, yb0)
@@ -112,7 +117,15 @@ def build_tri_inverse_program(
                             xa = pl.slice(X_state, [m_tile, k_tile], [mb, k0])
                             yb = pl.slice(Y_state, [k_tile, n], [k0, 0])
                             acc = pl.matmul_acc(acc, xa, yb)
-                        x_new_row = pl.add(x_row, acc)
+                        X_acc = pl.assemble(X_acc, acc, [mb, 0])
+
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="cayley_x_add"):
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        x_row = pl.slice(X_state, [m_tile, n], [mb, 0])
+                        acc_row = pl.slice(X_acc, [m_tile, n], [mb, 0])
+                        x_new_row = pl.add(x_row, acc_row)
                         X_state = pl.assemble(X_state, x_new_row, [mb, 0])
 
                 with pl.at(level=pl.Level.CORE_GROUP,
@@ -187,6 +200,7 @@ def build_batched_tri_inverse_program(
             X_state = pl.create_tensor([big, n], dtype=pl.FP32)
             Y_state = pl.create_tensor([big, n], dtype=pl.FP32)
             Y_temp = pl.create_tensor([big, n], dtype=pl.FP32)
+            X_acc = pl.create_tensor([big, n], dtype=pl.FP32)
 
             with pl.at(level=pl.Level.CORE_GROUP,
                        optimization=pl.chunked_loop_optimizer,
@@ -200,13 +214,14 @@ def build_batched_tri_inverse_program(
                         Y_state = pl.assemble(Y_state, a_row, [base + mb, 0])
 
             for step in pl.unroll(n_steps):
+                # See build_tri_inverse_program for why the X update is split
+                # across two pl.at scopes (Vec budget at n=256+).
                 with pl.at(level=pl.Level.CORE_GROUP,
                            optimization=pl.chunked_loop_optimizer,
-                           name_hint="cayley_batched_x_update"):
+                           name_hint="cayley_batched_x_matmul"):
                     for b in pl.parallel(0, batch, 1, chunk=b_chunk):
                         base = b * n
                         for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
-                            x_row = pl.slice(X_state, [m_tile, n], [base + mb, 0])
                             xa0 = pl.slice(X_state, [m_tile, k_tile], [base + mb, 0])
                             yb0 = pl.slice(Y_state, [k_tile, n], [base, 0])
                             acc = pl.matmul(xa0, yb0)
@@ -215,7 +230,17 @@ def build_batched_tri_inverse_program(
                                 xa = pl.slice(X_state, [m_tile, k_tile], [base + mb, k0])
                                 yb = pl.slice(Y_state, [k_tile, n], [base + k0, 0])
                                 acc = pl.matmul_acc(acc, xa, yb)
-                            x_new_row = pl.add(x_row, acc)
+                            X_acc = pl.assemble(X_acc, acc, [base + mb, 0])
+
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="cayley_batched_x_add"):
+                    for b in pl.parallel(0, batch, 1, chunk=b_chunk):
+                        base = b * n
+                        for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                            x_row = pl.slice(X_state, [m_tile, n], [base + mb, 0])
+                            acc_row = pl.slice(X_acc, [m_tile, n], [base + mb, 0])
+                            x_new_row = pl.add(x_row, acc_row)
                             X_state = pl.assemble(X_state, x_new_row, [base + mb, 0])
 
                 with pl.at(level=pl.Level.CORE_GROUP,
