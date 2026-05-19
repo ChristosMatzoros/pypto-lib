@@ -37,23 +37,40 @@ import pypto.language as pl
 # ---------------------------------------------------------------------------
 N = 128  # matrix dimension; fixed for the Qwen3-Next chunked GDN tri-inverse
 M_TILE = 32  # row-tile size for the M-parallel inner loop
-K_TILE = 64  # K-reduction tile (gemm-style K-blocking inside each matmul)
-M_CHUNK = 1  # M-tiles bundled per incore kernel
-B_CHUNK = 1  # batch elements bundled per incore kernel in the batched build
+M_CHUNK = 4  # M-tiles bundled per incore kernel
+B_CHUNK = 8  # batch elements bundled per incore kernel in the batched build
+
+
+def _pick_k_tile(n: int) -> int:
+    """Pick the largest K-reduction tile that keeps the cube's right operand
+    inside its 64 KB ``mat_right`` cache (16384 FP32 elements).
+
+    At n=128 ``k_tile=128`` gives the right operand exactly [128, 128] = 64 KB
+    (full fill) AND collapses the K-block loop to a single matmul, which is
+    the v6_full_k sweet spot from PERF_ANALYSIS.md -- per-inverse NPU time
+    drops 40 %.  At n>=256 we have to fall back to 64-element K tiles so the
+    right operand [64, n] stays under 64 KB.
+    """
+    return 128 if n <= 128 else 64
 
 
 def build_tri_inverse_program(
     n: int = N,
     m_tile: int = M_TILE,
-    k_tile: int = K_TILE,
+    k_tile: int | None = None,
     m_chunk: int = M_CHUNK,
 ):
     """Build the @pl.program for n x n triangular inverse.
 
     Specialises the doubling-step count via ceil(log2(n)).
     """
+    if k_tile is None:
+        k_tile = _pick_k_tile(n)
+    # Clamp m_chunk so it never exceeds the M-tile count (otherwise the
+    # chunked_loop_optimizer rejects the loop).
+    m_chunk = max(1, min(m_chunk, n // m_tile))
     n_steps = max(1, (n - 1).bit_length())  # 7 for n=128
-    k_blocks = n // k_tile  # 2 for n=128, k_tile=64
+    k_blocks = n // k_tile  # 1 at n=128 (full K), 4 at n=256, 8 at n=512
 
     @pl.program
     class TriInverseProgram:
@@ -164,7 +181,7 @@ def build_batched_tri_inverse_program(
     n: int = N,
     batch: int = 1,
     m_tile: int = M_TILE,
-    k_tile: int = K_TILE,
+    k_tile: int | None = None,
     m_chunk: int = M_CHUNK,
     b_chunk: int = B_CHUNK,
 ):
@@ -180,12 +197,32 @@ def build_batched_tri_inverse_program(
     7-iter doubling can flow across pl.at scopes without aliasing other
     batch elements.
 
+    Defaults are tuned via PERF_ANALYSIS.md sweep on Ascend 910B2:
+
+    - ``k_tile = n`` at n=128 (no K-blocking, single full-K matmul) fills
+      the cube's 64 KB ``mat_right`` cache exactly and hits 512-B MTE
+      alignment; ``k_tile = 64`` at n>=256 stays inside the same cache.
+      ``_pick_k_tile(n)`` does this automatically.
+    - ``m_chunk=4`` and ``b_chunk=8`` bundle more iters per InCore kernel,
+      cutting AICPU dispatch overhead at high batch.  At the Qwen3-Next
+      operating point (n=128, batch=256) the two changes together drop
+      per-inverse NPU device time from 0.098 ms to 0.059 ms (-40 %); at
+      low batch (b=4) the chunk bundling is a no-op so n>=256 cases are
+      not regressed.
+
     For batch=1 this collapses to the same shape as build_tri_inverse_program;
     use the unbatched version when timing single calls and the batched
     version when amortising NPU launch overhead across many matrices.
     """
+    if k_tile is None:
+        k_tile = _pick_k_tile(n)
+    # Clamp chunks so they never exceed iteration counts (otherwise the
+    # chunked_loop_optimizer rejects the loop).  This makes the defaults
+    # safe at every (n, batch); large chunks just clamp at small shapes.
+    m_chunk = max(1, min(m_chunk, n // m_tile))
+    b_chunk = max(1, min(b_chunk, batch))
     n_steps = max(1, (n - 1).bit_length())
-    k_blocks = n // k_tile
+    k_blocks = n // k_tile  # 1 at n=128 (full K), 4 at n=256, 8 at n=512
     big = batch * n  # flat row dim covering all batch elements
 
     @pl.program
