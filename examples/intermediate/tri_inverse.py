@@ -36,9 +36,13 @@ import pypto.language as pl
 # Algorithm parameters
 # ---------------------------------------------------------------------------
 N = 128  # matrix dimension; fixed for the Qwen3-Next chunked GDN tri-inverse
-M_TILE = 32  # row-tile size for the M-parallel inner loop
-M_CHUNK = 4  # M-tiles bundled per incore kernel
-B_CHUNK = 8  # batch elements bundled per incore kernel in the batched build
+# Tile-size sweep showed M_TILE=128 (full-M, one matmul per matrix per scope)
+# beats the previous 32-row split by 17-19 % at B=2 T=10000.  Each pl.matmul
+# now does the full [128, 128]@[128, 128] in one call so the compiler
+# emits 4 x fewer scope-pipeline-sync ops (set_flag/wait_flag/TEXTRACT/...).
+M_TILE = 128  # row-tile size for the M-parallel inner loop
+M_CHUNK = 1   # M-tiles bundled per incore kernel (n/m_tile=1 at n=128, m_tile=128)
+B_CHUNK = 32  # batch elements bundled per incore kernel in the batched build
 
 
 def _pick_k_tile(n: int) -> int:
